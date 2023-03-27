@@ -1,0 +1,304 @@
+import psycopg2 as cx
+import pandas as pd
+
+from datetime import datetime, timedelta
+
+
+conn = cx.connect(dbname="btc", user="pt", password="pt", host="loki")
+conn.autocommit = True
+cur = conn.cursor()
+
+
+
+def fetch(dt: str):
+    sql = f"""
+    select id, sum(v_rev + s_rev + db_rev + dr_rev)
+    from s02_p01_{dt}
+    group by id
+    """
+
+    cur.execute(sql)
+
+    revenues = pd.DataFrame(cur.fetchall())
+    revenues.columns = ["ID", "Revenue"]
+    revenues.set_index("ID", inplace=True)
+
+    sql = f"""
+    select id, event_label, sum(cost)
+    from s02_bolton_{dt}_sync
+    where to_char(start_time::date, 'yyyymm') = '{dt[:6]}'
+    group by id, event_label
+    """
+
+    cur.execute(sql)
+    boltons = pd.DataFrame(cur.fetchall())
+    boltons.columns = ["ID", "Label", "BoltonRevenue"]
+    boltons.set_index("ID", inplace=True)
+
+    return revenues, boltons
+
+
+# In[4]:
+
+
+def fetch_explicit(dt: str, upper=str):
+    sql = f"""
+    select id, sum(v_rev + s_rev + db_rev + dr_rev)
+    from s02_p01_{dt}
+    where the_date < '{upper}'
+    group by id
+    """
+
+    cur.execute(sql)
+
+    revenues = pd.DataFrame(cur.fetchall())
+    revenues.columns = ["ID", "Revenue"]
+    revenues.set_index("ID", inplace=True)
+
+    sql = f"""
+    select id, event_label, sum(cost)
+    from s02_bolton_{dt}_sync
+    where to_char(start_time::date, 'yyyymm') = '{dt[:6]}'
+          and start_time < '{upper}'
+    group by id, event_label
+    """
+
+    cur.execute(sql)
+    boltons = pd.DataFrame(cur.fetchall())
+    boltons.columns = ["ID", "Label", "BoltonRevenue"]
+    boltons.set_index("ID", inplace=True)
+
+    return revenues, boltons
+
+
+
+
+def make_bins(bins):
+    labels = [f'[{bins[ix]}, {bins[ix + 1]})' for ix in range(len(bins) - 2)]
+    labels.append(f'>= {bins[-2]}')
+
+revenue_bins = [0, 5, 15, 25, 35, 60, 100, 250, 1000000]
+
+
+
+
+m3_revenues, m3_boltons = fetch('20221130')
+m2_revenues, m2_boltons = fetch('20221231')
+m1_revenues, m1_boltons = fetch('20230131')
+m0_revenues, m0_boltons = fetch('20230228')
+
+
+
+# 2nd Parameter is last date of report
+mr_revenues, mr_boltons = fetch_explicit('20230331', '19-MAR-2023')
+
+
+
+
+tbl_a_m3 = pd.DataFrame(m3_revenues.iloc[m3_revenues.index.isin(m3_boltons.index)])
+tbl_a_m3['Bin'] = pd.cut(tbl_a_m3.Revenue, bins=revenue_bins, labels=make_bins(revenue_bins))
+
+
+tbl_a_m2 = pd.DataFrame(m2_revenues.iloc[m2_revenues.index.isin(m2_boltons.index)])
+tbl_a_m2['Bin'] = pd.cut(tbl_a_m2.Revenue, bins=revenue_bins, labels=make_bins(revenue_bins))
+
+
+
+tbl_a_m1 = pd.DataFrame(m1_revenues.iloc[m1_revenues.index.isin(m1_boltons.index)])
+tbl_a_m1['Bin'] = pd.cut(tbl_a_m1.Revenue, bins=revenue_bins, labels=make_bins(revenue_bins))
+
+
+
+
+tbl_a_m0 = pd.DataFrame(m0_revenues.iloc[m0_revenues.index.isin(m0_boltons.index)])
+tbl_a_m0['Bin'] = pd.cut(tbl_a_m0.Revenue, bins=revenue_bins, labels=make_bins(revenue_bins))
+
+
+
+
+tbl_a = pd.merge(tbl_a_m3.groupby('Bin').size().rename('M3'),
+                 tbl_a_m2.groupby('Bin').size().rename('M2'),
+                 left_index=True, right_index=True)
+
+tbl_a = pd.merge(tbl_a,
+                 tbl_a_m1.groupby('Bin').size().rename('M1'),
+                 left_index=True, right_index=True)
+
+
+
+
+print(tbl_a)
+
+
+
+
+dropouts_m3 = set(tbl_a_m3.index) - set(tbl_a_m2.index)
+dropouts_m2 = set(tbl_a_m2.index) - set(tbl_a_m1.index)
+dropouts_m1 = set(tbl_a_m1.index) - set(tbl_a_m0.index)
+
+
+
+
+tbl_b = pd.merge(tbl_a_m3.iloc[tbl_a_m3.index.isin(dropouts_m3)].groupby('Bin').size().rename('M3'),
+                 tbl_a_m2.iloc[tbl_a_m2.index.isin(dropouts_m2)].groupby('Bin').size().rename('M2'),
+                 left_index = True,
+                 right_index = True
+                )
+
+tbl_b = pd.merge(tbl_b,
+                 tbl_a_m1.iloc[tbl_a_m1.index.isin(dropouts_m1)].groupby('Bin').size().rename('M1'),
+                 left_index = True,
+                 right_index = True
+                )
+
+
+
+
+
+print("Dropped out in the Subsequent Month")
+print(tbl_b)
+
+
+
+
+still_m3 = dropouts_m3 - (set(tbl_a_m1.index) | set(tbl_a_m0.index) | set(mr_boltons.index))
+still_m2 = dropouts_m2 - (set(tbl_a_m0.index) | set(mr_boltons.index))
+still_m1 = dropouts_m1 - (set(mr_boltons.index))
+
+
+
+
+tbl_c = pd.merge(tbl_a_m3.iloc[tbl_a_m3.index.isin(still_m3)].groupby('Bin').size().rename('M3'),
+                 tbl_a_m2.iloc[tbl_a_m2.index.isin(still_m2)].groupby('Bin').size().rename('M2'),
+                 left_index = True,
+                 right_index = True
+                )
+
+tbl_c = pd.merge(tbl_c,
+                 tbl_a_m1.iloc[tbl_a_m1.index.isin(still_m1)].groupby('Bin').size().rename('M1'),
+                 left_index = True,
+                 right_index = True
+                )
+
+
+
+
+print("Continue to be dropouts")
+print(tbl_c)
+revived_m3 = dropouts_m3.intersection(set(tbl_a_m1.index) | set(tbl_a_m0.index) | set(mr_boltons.index))
+revived_m2 = dropouts_m2.intersection(set(tbl_a_m0.index) | set(mr_boltons.index))
+revived_m1 = dropouts_m1.intersection(set(mr_boltons.index))
+
+
+
+
+tbl_d = pd.merge(tbl_a_m3.iloc[tbl_a_m3.index.isin(revived_m3)].groupby('Bin').size().rename('M3'),
+                 tbl_a_m2.iloc[tbl_a_m2.index.isin(revived_m2)].groupby('Bin').size().rename('M2'),
+                 left_index = True,
+                 right_index = True
+                )
+
+tbl_d = pd.merge(tbl_d,
+                 tbl_a_m1.iloc[tbl_a_m1.index.isin(revived_m1)].groupby('Bin').size().rename('M1'),
+                 left_index = True,
+                 right_index = True
+                )
+
+
+
+
+print("Revived since")
+print(tbl_d)
+
+
+
+
+churned_m3 = dropouts_m3 - (set(m2_revenues.index) | set(m1_revenues.index) | set(m0_revenues.index) | set(mr_revenues.index))
+churned_m2 = dropouts_m2 - (set(m1_revenues.index) | set(m0_revenues.index) | set(mr_revenues.index))
+churned_m1 = dropouts_m1 - (set(m0_revenues.index) | set(mr_revenues.index))
+
+
+
+
+tbl_e = pd.merge(tbl_a_m3.iloc[tbl_a_m3.index.isin(churned_m3)].groupby('Bin').size().rename('M3'),
+                 tbl_a_m2.iloc[tbl_a_m2.index.isin(churned_m2)].groupby('Bin').size().rename('M2'),
+                 left_index = True,
+                 right_index = True
+                )
+
+tbl_e = pd.merge(tbl_e,
+                 tbl_a_m1.iloc[tbl_a_m1.index.isin(churned_m1)].groupby('Bin').size().rename('M1'),
+                 left_index = True,
+                 right_index = True
+                )
+print("Churned since")
+print(tbl_e)
+
+#Current
+pre_post = pd.merge(m1_boltons.iloc[m1_boltons.index.isin(still_m1)],
+                    m1_revenues.iloc[m1_revenues.index.isin(still_m1)],
+                    left_index=True,
+                    right_index=True,
+                    how='left')
+
+
+
+
+# Post
+pre_post = pd.merge(pre_post,
+                    m0_revenues.iloc[m0_revenues.index.isin(still_m1)],
+                    left_index=True,
+                    right_index=True,
+                    suffixes=(None, '_m0'),
+                    how='left')
+
+
+
+
+# Pre-Bolton
+pre_post = pd.merge(pre_post,
+                    m2_boltons.iloc[m2_boltons.index.isin(still_m1)].groupby('ID')['BoltonRevenue'].sum(),
+                    left_index=True,
+                    right_index=True,
+                    suffixes=(None, '_m2'),
+                    how='left')
+
+
+
+pre_post = pd.merge(pre_post,
+                    m0_boltons.iloc[m0_boltons.index.isin(still_m1)].groupby('ID')['BoltonRevenue'].sum(),
+                    left_index=True,
+                    right_index=True,
+                    suffixes=(None, '_m0'),
+                    how='left')
+
+# Pre-Revenue
+pre_post = pd.merge(pre_post,
+                    m2_revenues.iloc[m2_revenues.index.isin(still_m1)],
+                    left_index=True,
+                    right_index=True,
+                    suffixes=(None, '_m2'),
+                    how='left')
+
+
+
+
+pre_post = pre_post.groupby("Label").agg({'BoltonRevenue_m2': sum,
+                               'Revenue_m2': sum,
+                               'BoltonRevenue': sum,
+                               'Revenue': sum,
+                               'BoltonRevenue_m0': sum,
+                               'Revenue_m0': sum
+                              })
+
+
+
+
+pre_post = pre_post.join(m1_boltons.iloc[m1_boltons.index.isin(still_m1)].groupby('Label').size().rename("Count"))
+
+
+
+
+print(pre_post[["Count", "BoltonRevenue_m2", 'Revenue_m2', 'BoltonRevenue', 'Revenue', 'BoltonRevenue_m0', 'Revenue_m0']])
+
+                                                                                      c
